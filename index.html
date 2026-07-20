@@ -82,6 +82,7 @@
     </div>
     <div class="status">কনফিডেন্স স্কোর: <span id="confidence">—</span></div>
     <div class="status">লেয়ার: <span id="layer">—</span></div>
+    <div class="status">DNS ভার্ডিক্ট (differential probe): <span id="dns-verdict">—</span></div>
     <pre id="raw-signals"></pre>
   </div>
 
@@ -101,6 +102,7 @@
     const badge = document.getElementById('badge');
     const confidenceEl = document.getElementById('confidence');
     const layerEl = document.getElementById('layer');
+    const dnsVerdictEl = document.getElementById('dns-verdict');
     const rawEl = document.getElementById('raw-signals');
     const overlay = document.getElementById('adblock-overlay');
 
@@ -115,7 +117,14 @@
       badge.className = 'badge ' + (result.blocked ? 'blocked' : 'clean');
       confidenceEl.textContent = result.confidence;
       layerEl.textContent = result.layer;
-      rawEl.textContent = JSON.stringify(result.signals, null, 2);
+      dnsVerdictEl.textContent = result.differentialDns
+        ? result.differentialDns.verdict
+        : '—';
+      rawEl.textContent = JSON.stringify(
+        { signals: result.signals, differentialDns: result.differentialDns, dnsProviders: result.dnsProviders },
+        null,
+        2
+      );
 
       // শুধু যথেষ্ট কনফিডেন্ট হলেই ইউজারকে জানাও — অল্প সিগন্যালে
       // হুট করে "ব্লকার আছে" বলে দিলে false-positive-এ বিরক্তিকর অভিজ্ঞতা হয়
