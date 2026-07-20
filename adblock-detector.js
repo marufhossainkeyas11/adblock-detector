@@ -16,6 +16,10 @@
  *   4. DNS self-check API    -> dns.adguard.com/test.json দিয়ে নির্দিষ্ট
  *                                 DNS resolver active কিনা (extension
  *                                 থেকে independent সিগন্যাল)
+ *   4.5 Differential DoH probe -> direct request বনাম DoH resolve তুলনা
+ *                                 করে extension-level বনাম DNS-level
+ *                                 ব্লক আলাদা করে (সবচেয়ে নির্ভরযোগ্য
+ *                                 layer-classification সিগন্যাল)
  *   5. MutationObserver      -> পরে bait remove হলে (lazy blockers) ধরে
  *
  * ব্যবহার:
@@ -87,6 +91,7 @@
       localScriptBlocked: 0.25,
       remoteScriptBlocked: 0.15,
       dnsProbeBlocked: 0.20,
+      dnsLevelConfirmed: 0.30, // differential probe দিয়ে DNS-level নিশ্চিত হলে
       mutationRemoval: 0.30,
     },
 
@@ -282,6 +287,123 @@
   }
 
   // -----------------------------------------------------------------------
+  // টেকনিক ৪.৫: Differential DoH probe — DNS-level vs extension-level
+  // -----------------------------------------------------------------------
+  // ইউজারের আইডিয়া: "ad ডোমেইনে রিকোয়েস্ট পাঠাও, fail হলে DNS ব্লক ধরে
+  // নাও" — এই আইডিয়াটা নিজে থেকে কাজ করে না, কারণ extension-block আর
+  // DNS-block ব্রাউজারের কাছে identical দেখায় (দুটোই fetch() কে reject
+  // করায়)। কোনটার জন্য fail হলো সেটা আলাদা করতে হলে দুটো ভিন্ন-রুটের
+  // রিকোয়েস্ট পাঠিয়ে ফলাফল তুলনা করতে হয় (differential probing):
+  //
+  //   রিকোয়েস্ট A (direct):  ad ডোমেইনে সরাসরি fetch — extension ও DNS
+  //                            দুটোই এটা আটকাতে পারে
+  //   রিকোয়েস্ট B (DoH):      সেই একই ad ডোমেইনের নাম DNS-over-HTTPS
+  //                            (Cloudflare/Google পাবলিক resolver) দিয়ে
+  //                            resolve করা — এটা `doubleclick.net`-এ
+  //                            direct request না, বরং `cloudflare-dns.com`
+  //                            বা `dns.google`-এ JSON API কল, তাই filter
+  //                            list এটাকে "ad request" হিসেবে চেনে না ও
+  //                            ব্লক করে না।
+  //
+  // ফলাফল তুলনা:
+  //   A fail + B success -> extension/browser-level block (network-layer
+  //                          DNS ঠিকই resolve হচ্ছে, শুধু direct request
+  //                          আটকানো হচ্ছে)
+  //   A fail + B fail     -> DNS/network-level block (bypass route দিয়েও
+  //                          resolve হচ্ছে না -- device/router-level
+  //                          DNS override বা প্রকৃত sinkhole)
+  //   A success           -> কোনো ব্লক নেই (B না চেক করলেও চলে)
+  //
+  // এই টেকনিকটা যেকোনো DNS-level ব্লকিং সিস্টেমের জন্যই কাজ করে
+  // (Pi-hole, AdGuard DNS, router-level, ISP-level) -- নির্দিষ্ট
+  // প্রোভাইডারের self-check API-র উপর নির্ভর করে না, তাই generic।
+  const DOH_RESOLVER = 'https://cloudflare-dns.com/dns-query';
+  const DOH_TEST_DOMAIN = 'doubleclick.net'; // known-ad ডোমেইন, filter list-এ সাধারণত থাকে
+
+  // ⚠️ গুরুত্বপূর্ণ সীমাবদ্ধতা: no-cors mode এ fetch() সবসময় opaque
+  // response দেয় (status/body পড়া যায় না), request network-error না
+  // হলে promise resolve-ই হয় -- এমনকি server 404/500 দিলেও। তাই এই
+  // A-probe আসলে যাচাই করছে "network/DNS layer পর্যন্ত request
+  // পৌঁছাতে পেরেছে কিনা", response এর বিষয়বস্তু না। এটা এই টেকনিকের
+  // জন্য ঠিক আছে -- আমরা শুধু "reach করলো নাকি path-এ কোথাও আটকে
+  // গেল (DNS resolve না হওয়া, extension abort করা, connection
+  // refused)" সেটাই জানতে চাই।
+  async function directRequestBlocked(timeoutMs) {
+    // A: ad ডোমেইনে সরাসরি request -- extension ও DNS দুটোই আটকাতে পারে
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      await fetch(`https://${DOH_TEST_DOMAIN}/favicon.ico`, {
+        method: 'GET',
+        mode: 'no-cors',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      return false;
+    } catch (err) {
+      clearTimeout(timer);
+      return true; // fail/timeout দুটোকেই ব্লক ধরছি (A এর ক্ষেত্রে এটা যথেষ্ট, কারণ B দিয়ে confirm করা হবে)
+    }
+  }
+
+  async function dohResolves(domain, timeoutMs) {
+    // B: DoH JSON API দিয়ে resolve -- extension এর কাছে এটা "ad request"
+    // মনে হয় না, কারণ URL/host ভিন্ন (cloudflare-dns.com, doubleclick.net না)
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(
+        `${DOH_RESOLVER}?name=${encodeURIComponent(domain)}&type=A`,
+        {
+          method: 'GET',
+          mode: 'cors',
+          cache: 'no-store',
+          signal: controller.signal,
+          headers: { Accept: 'application/dns-json' },
+        }
+      );
+      clearTimeout(timer);
+      if (!res.ok) return null; // request নিজেই ব্যর্থ -- অনিশ্চিত, "resolved হয়নি" না ধরে null
+      const data = await res.json();
+      // Status 0 = NOERROR এবং Answer অ্যারেতে অন্তত একটা রেকর্ড থাকলে resolve হয়েছে ধরি
+      const resolved =
+        data && data.Status === 0 && Array.isArray(data.Answer) && data.Answer.length > 0;
+      return resolved;
+    } catch (err) {
+      clearTimeout(timer);
+      return null; // DoH নিজেই fail (নেটওয়ার্ক/CORS ইস্যু) -- এটাকে "DNS block" এর প্রমাণ ধরা যাবে না
+    }
+  }
+
+  async function checkDifferentialDns() {
+    const directBlocked = await directRequestBlocked(CONFIG.timeouts.dnsProbeMs);
+
+    // direct request-ই সফল হলে কোনো ব্লক নেই, DoH চেক করার দরকার নেই
+    if (!directBlocked) {
+      return { verdict: 'none', directBlocked: false, dohResolved: null };
+    }
+
+    const dohResolved = await dohResolves(DOH_TEST_DOMAIN, CONFIG.timeouts.dnsProbeMs);
+
+    if (dohResolved === null) {
+      // DoH নিজেই অনিশ্চিত (network/CORS issue) -- সিদ্ধান্ত নেওয়ার
+      // মতো যথেষ্ট তথ্য নেই, conservatively "unknown" ধরছি
+      return { verdict: 'unknown', directBlocked: true, dohResolved: null };
+    }
+
+    if (dohResolved === true) {
+      // direct fail কিন্তু DoH দিয়ে ঠিকই resolve হচ্ছে
+      // -> DNS স্তর পরিষ্কার, সমস্যাটা extension/browser-level
+      return { verdict: 'extension_level', directBlocked: true, dohResolved: true };
+    }
+
+    // direct fail এবং DoH দিয়েও resolve হচ্ছে না
+    // -> bypass route দিয়েও আটকে যাচ্ছে -> DNS/network-level block
+    return { verdict: 'dns_level', directBlocked: true, dohResolved: false };
+  }
+
+  // -----------------------------------------------------------------------
   // টেকনিক ৫: MutationObserver — দেরিতে bait সরানো (lazy blockers)
   // -----------------------------------------------------------------------
   // কিছু ব্লকার পেজ লোডের পরপরই কাজ করে না, MutationObserver বা periodic
@@ -335,11 +457,13 @@
         localScriptBlocked,
         remoteScriptBlocked,
         dnsCheck,
+        differentialDns,
       ] = await Promise.all([
         checkBaitElement(),
         checkLocalBaitScript(),
         checkRemoteAdScripts(),
         checkDnsProviders(),
+        checkDifferentialDns(),
       ]);
 
       const signals = {
@@ -348,6 +472,7 @@
         localScriptBlocked,
         remoteScriptBlocked,
         dnsProbeBlocked: dnsCheck.blocked,
+        dnsLevelConfirmed: differentialDns.verdict === 'dns_level',
       };
 
       let confidence = 0;
@@ -360,10 +485,6 @@
 
       // কোন লেয়ারে ব্লক হচ্ছে সেটা আলাদাভাবে classify করি —
       // এটা আসল প্রশ্নের একটা গুরুত্বপূর্ণ অংশ: "কোন ধরনের ব্লকার"
-      // dnsProbeBlocked এখন নিজে থেকেই নির্ভরযোগ্য (provider self-check
-      // থেকে আসা), তাই এটাকে else-if এর সবার শেষে না রেখে independent
-      // ভাবে যোগ করছি — DNS-resolver active থাকলে extension না থাকলেও
-      // সেটা রিপোর্ট হওয়া উচিত।
       const layers = [];
       if (signals.baitElementHidden || signals.baitElementRemoved) {
         layers.push('browser_or_extension'); // cosmetic filtering -> extension/Brave/Firefox
@@ -374,6 +495,13 @@
       if (signals.dnsProbeBlocked) {
         layers.push('dns_resolver'); // dns.adguard.com ইত্যাদি self-check অনুযায়ী active DNS filtering
       }
+      // differential probe সবচেয়ে নির্ভরযোগ্য layer-classification সিগন্যাল,
+      // কারণ এটা সরাসরি "কেন fail হলো" পরীক্ষা করে বের করে, অনুমান করে না
+      if (differentialDns.verdict === 'dns_level') {
+        layers.push('dns_level_confirmed'); // DoH bypass দিয়েও resolve হয়নি -> নিশ্চিত DNS/network block
+      } else if (differentialDns.verdict === 'extension_level') {
+        layers.push('extension_level_confirmed'); // DoH দিয়ে resolve হয়েছে, direct request-ই শুধু আটকেছে
+      }
       const layer = layers.length ? layers.join('+') : 'none';
 
       return {
@@ -381,7 +509,8 @@
         confidence: Number(confidence.toFixed(2)),
         layer,
         layers,
-        dnsProviders: dnsCheck.providers, // কোন কোন DNS প্রোভাইডার active ধরা পড়েছে
+        dnsProviders: dnsCheck.providers, // কোন কোন DNS প্রোভাইডার active ধরা পড়েছে (self-check থেকে)
+        differentialDns, // { verdict, directBlocked, dohResolved } -- raw ডিবাগ তথ্য
         signals,
       };
     })();
