@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8" />
+<title>Adblock Detector — Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 640px;
+    margin: 40px auto;
+    padding: 0 20px;
+    background: #0f1115;
+    color: #e8e8e8;
+  }
+  h1 { font-size: 20px; }
+  .card {
+    background: #1a1d24;
+    border: 1px solid #2a2e37;
+    border-radius: 10px;
+    padding: 20px;
+    margin-top: 16px;
+  }
+  .status { font-size: 15px; margin-bottom: 8px; }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge.blocked { background: #3a1d1d; color: #ff6b6b; }
+  .badge.clean   { background: #1d3a24; color: #6bff9e; }
+  pre {
+    background: #0b0d11;
+    padding: 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 13px;
+  }
+  button {
+    background: #2f6fed;
+    color: white;
+    border: none;
+    padding: 10px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button:hover { background: #2559c2; }
+
+  /* এই overlay টা শুধু তখনই দেখাবে যখন confidence যথেষ্ট বেশি হবে */
+  #adblock-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.75);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+  }
+  #adblock-overlay .box {
+    background: #1a1d24;
+    padding: 28px;
+    border-radius: 12px;
+    max-width: 380px;
+    text-align: center;
+  }
+  #adblock-overlay button { margin-top: 14px; }
+</style>
+</head>
+<body>
+
+  <h1>Adblock Detector — টেস্ট পেজ</h1>
+  <p>নিচের বাটনে চাপ দিলে সব কয়টা টেকনিক একসাথে রান হবে এবং ফলাফল দেখাবে।</p>
+
+  <button id="run-btn">ডিটেকশন চালাও</button>
+
+  <div class="card" id="result-card" style="display:none;">
+    <div class="status">
+      অবস্থা: <span id="badge" class="badge">—</span>
+    </div>
+    <div class="status">কনফিডেন্স স্কোর: <span id="confidence">—</span></div>
+    <div class="status">লেয়ার: <span id="layer">—</span></div>
+    <pre id="raw-signals"></pre>
+  </div>
+
+  <!-- soft overlay: হার্ড ব্লক না করে, শুধু অনুরোধ করা -->
+  <div id="adblock-overlay">
+    <div class="box">
+      <p>আমরা লক্ষ্য করেছি আপনার ব্রাউজারে অ্যাড-ব্লকার বা প্রাইভেসি ফিল্টার চালু আছে।</p>
+      <p>সাইটটা ফ্রি রাখতে বিজ্ঞাপনগুলো সাহায্য করে। চাইলে হোয়াইটলিস্ট করে দেখতে পারেন।</p>
+      <button id="dismiss-btn">বুঝেছি, চালিয়ে যাও</button>
+    </div>
+  </div>
+
+  <script src="./adblock-detector.js"></script>
+  <script>
+    const runBtn = document.getElementById('run-btn');
+    const card = document.getElementById('result-card');
+    const badge = document.getElementById('badge');
+    const confidenceEl = document.getElementById('confidence');
+    const layerEl = document.getElementById('layer');
+    const rawEl = document.getElementById('raw-signals');
+    const overlay = document.getElementById('adblock-overlay');
+
+    async function runDetection() {
+      runBtn.disabled = true;
+      runBtn.textContent = 'চেক করা হচ্ছে…';
+
+      const result = await AdblockDetector.detect();
+
+      card.style.display = 'block';
+      badge.textContent = result.blocked ? 'ব্লকার সনাক্ত হয়েছে' : 'কিছু পাওয়া যায়নি';
+      badge.className = 'badge ' + (result.blocked ? 'blocked' : 'clean');
+      confidenceEl.textContent = result.confidence;
+      layerEl.textContent = result.layer;
+      rawEl.textContent = JSON.stringify(result.signals, null, 2);
+
+      // শুধু যথেষ্ট কনফিডেন্ট হলেই ইউজারকে জানাও — অল্প সিগন্যালে
+      // হুট করে "ব্লকার আছে" বলে দিলে false-positive-এ বিরক্তিকর অভিজ্ঞতা হয়
+      if (result.confidence >= 0.5) {
+        overlay.style.display = 'flex';
+      }
+
+      runBtn.disabled = false;
+      runBtn.textContent = 'আবার চেক করো';
+
+      // সার্ভারকে জানানো (শুধু উদাহরণ — নিজের এন্ডপয়েন্ট বসাতে হবে)
+      // fetch('/api/adblock-signal', {
+      //   method: 'POST',
+      //   headers: { 'Content-Type': 'application/json' },
+      //   body: JSON.stringify(result),
+      // });
+    }
+
+    runBtn.addEventListener('click', runDetection);
+    document.getElementById('dismiss-btn').addEventListener('click', () => {
+      overlay.style.display = 'none';
+    });
+
+    // চাইলে পেজ লোডেই অটো-রান করানো যায়:
+    // window.addEventListener('load', () => setTimeout(runDetection, 500));
+  </script>
+</body>
+</html>
