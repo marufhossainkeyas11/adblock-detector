@@ -13,7 +13,9 @@
  *   1. Bait DOM element      -> extension/browser cosmetic filtering ধরে
  *   2. Bait network request  -> extension/browser network filtering ধরে
  *   3. Known ad script URL   -> filter list (EasyList ইত্যাদি) ধরে
- *   4. DNS-sinkhole probe    -> Pi-hole/NextDNS/router-level DNS block ধরে
+ *   4. DNS self-check API    -> dns.adguard.com/test.json দিয়ে নির্দিষ্ট
+ *                                 DNS resolver active কিনা (extension
+ *                                 থেকে independent সিগন্যাল)
  *   5. MutationObserver      -> পরে bait remove হলে (lazy blockers) ধরে
  *
  * ব্যবহার:
@@ -49,13 +51,26 @@
     // (নিচের ইনস্ট্রাকশন দ্রষ্টব্য — ad_728.js ফাইলটা বানিয়ে দিতে হবে)
     localBaitScript: '/ad_728.js',
 
-    // DNS-sinkhole probe: এই ডোমেইনগুলো prod-এ known-ad/tracker হিসেবে
-    // চিহ্নিত এবং প্রায় সব DNS blocklist (Pi-hole/NextDNS ডিফল্ট লিস্ট,
-    // Steven Black hosts, OISD) এ থাকে। image pixel দিয়ে লোড ট্রাই করা
-    // হয় কারণ img element cross-origin এরর ছাড়াই load/error event দেয়।
-    dnsProbeTargets: [
-      'https://pagead2.googlesyndication.com/pagead/images/pixel.gif',
-      'https://googleads.g.doubleclick.net/pagead/id',
+    // ⚠️ পুরনো approach বাদ: googlesyndication/doubleclick pixel probe
+    // extension filter list দিয়েও ব্লক হয়, তাই DNS-level আলাদা করা যেত না।
+    // এখন provider-নির্দিষ্ট "self-check" endpoint ব্যবহার হচ্ছে যা
+    // filter list এর টার্গেট না (তাই extension independent), বরং সরাসরি
+    // বলে দেয় client সেই DNS resolver দিয়ে resolve হচ্ছে কিনা।
+    dnsSelfCheckProviders: [
+      {
+        name: 'AdGuard DNS',
+        url: 'https://dns.adguard.com/test.json',
+        parse: (data) => {
+          if (!data || typeof data !== 'object') return false;
+          if (typeof data.status === 'boolean') return data.status;
+          if (typeof data.status === 'string') {
+            return /running|active|true|ok/i.test(data.status);
+          }
+          return Boolean(data.isUsingDns || data.adguard || data.protected);
+        },
+      },
+      // NextDNS যোগ করতে চাইলে:
+      // { name: 'NextDNS', url: 'https://test.nextdns.io', parse: (d) => d && d.status === 'ok' }
     ],
 
     timeouts: {
@@ -200,49 +215,70 @@
   }
 
   // -----------------------------------------------------------------------
-  // টেকনিক ৪: DNS-level sinkhole probe (Pi-hole / NextDNS / router)
+  // টেকনিক ৪: DNS-resolver self-check (AdGuard DNS / NextDNS ইত্যাদি)
   // -----------------------------------------------------------------------
-  // DNS sinkhole হলে ব্রাউজার সেই ডোমেইনের IP-ই resolve করতে পারে না,
-  // ফলে request timeout/network-error এ পড়ে (extension ব্লকের চেয়ে ধীর,
-  // কারণ TCP handshake ট্রাই হওয়ার সুযোগও পায় না বা bogus IP তে গিয়ে
-  // hang করে)। তাই timeout কেও এখানে positive সিগন্যাল ধরছি, কারণ এই
-  // ডোমেইনগুলো সচরাচর আপ থাকে ও দ্রুত রেসপন্স দেয়।
-  function dnsProbeViaImage(url, timeoutMs) {
-    return new Promise((resolve) => {
-      const img = new Image();
-      let settled = false;
-
-      const finish = (blocked) => {
-        if (settled) return;
-        settled = true;
-        resolve(blocked);
-      };
-
-      const timer = setTimeout(() => finish(true), timeoutMs);
-
-      img.onload = () => {
-        clearTimeout(timer);
-        finish(false);
-      };
-      img.onerror = () => {
-        clearTimeout(timer);
-        // onerror হতে পারে blocked pixel (1x1 gif সহ), বা সত্যিকারের ব্লক
-        finish(true);
-      };
-
-      img.src = url + (url.includes('?') ? '&' : '?') + '_=' + Date.now();
-    });
+  // বাগ ফিক্স নোট:
+  //   আগে googlesyndication.com/doubleclick.net-এ pixel পাঠিয়ে ব্লক
+  //   চেক করা হতো। সমস্যা: এই ডোমেইনগুলো extension filter list-এও থাকে,
+  //   তাই "block" পাওয়া মানেই DNS-level কিনা বলা যেত না। ব্রাউজারে
+  //   uBlock/ABP থাকলে dns.adguard.com অ্যাপ চালু থাক বা না থাক, ফলাফল
+  //   একই (block) আসতো।
+  //
+  //   এখন প্রতিটা DNS প্রোভাইডারের নিজস্ব "self-check" endpoint কল করা
+  //   হয় (dns.adguard.com/test.json)। এই endpoint কোনো filter list-এর
+  //   টার্গেট না (এটা ad/tracker ডোমেইন না, প্রোভাইডারের নিজস্ব info
+  //   API), তাই extension থাকা-না-থাকার সাথে ফলাফল independent থাকে।
+  //   রেসপন্সের ভেতরের ডেটা দিয়েই বোঝা যায় client সেই resolver দিয়ে
+  //   resolve হচ্ছে কিনা।
+  // ⚠️ CORS নোট: mode:'cors' ব্যবহার করা হয়েছে কারণ রেসপন্স JSON হিসেবে
+  // read করতে হবে (no-cors হলে opaque response আসে, .json() কল করা
+  // যাবে না)। কিন্তু এর মানে হলো — provider এর endpoint যদি
+  // Access-Control-Allow-Origin header না পাঠায়, browser fetch()-কে
+  // silently ব্লক করে দেবে (Network ট্যাবে request দেখা যাবে, response
+  // ঠিকই এসেছে, কিন্তু JS থেকে পড়া যাবে না — catch ব্লকে চলে যাবে)।
+  // এই কারণেই fail/CORS-কে "confirmed blocked" না ধরে null (অনিশ্চিত)
+  // রিটার্ন করা হচ্ছে -- ভুল করে false-positive না দেওয়ার জন্য।
+  // production এ বসানোর আগে browser console এ সরাসরি টেস্ট করে দেখে
+  // নাও endpoint টা আসলেই CORS-friendly response দেয় কিনা; না দিলে
+  // নিজের ব্যাকএন্ডে একটা ছোট প্রক্সি বসিয়ে ওখান থেকে কল করা লাগবে।
+  async function fetchJson(url, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        mode: 'cors',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (err) {
+      clearTimeout(timer);
+      return null; // fetch fail/timeout/CORS -> "নিশ্চিত করতে পারলাম না", ব্লক প্রমাণ না
+    }
   }
 
-  async function checkDnsSinkhole() {
-    const results = await Promise.all(
-      CONFIG.dnsProbeTargets.map((url) =>
-        dnsProbeViaImage(url, CONFIG.timeouts.dnsProbeMs)
-      )
+  async function checkDnsProviders() {
+    const outcomes = await Promise.all(
+      CONFIG.dnsSelfCheckProviders.map(async (provider) => {
+        const data = await fetchJson(provider.url, CONFIG.timeouts.dnsProbeMs);
+        let active = false;
+        try {
+          active = data ? Boolean(provider.parse(data)) : false;
+        } catch (e) {
+          active = false; // parse ব্যর্থ হলে "নিশ্চিত না" ধরি, positive না
+        }
+        return { name: provider.name, active };
+      })
     );
-    // দুইটার মধ্যে অন্তত একটা ব্লক হলে DNS/network-level ফিল্টারিং সন্দেহ করি
-    const blockedCount = results.filter(Boolean).length;
-    return blockedCount >= 1;
+
+    const activeProviders = outcomes.filter((o) => o.active).map((o) => o.name);
+    return {
+      blocked: activeProviders.length > 0,
+      providers: activeProviders,
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -298,12 +334,12 @@
         baitResult,
         localScriptBlocked,
         remoteScriptBlocked,
-        dnsBlocked,
+        dnsCheck,
       ] = await Promise.all([
         checkBaitElement(),
         checkLocalBaitScript(),
         checkRemoteAdScripts(),
-        checkDnsSinkhole(),
+        checkDnsProviders(),
       ]);
 
       const signals = {
@@ -311,7 +347,7 @@
         baitElementRemoved: baitResult.removed,
         localScriptBlocked,
         remoteScriptBlocked,
-        dnsProbeBlocked: dnsBlocked,
+        dnsProbeBlocked: dnsCheck.blocked,
       };
 
       let confidence = 0;
@@ -324,19 +360,28 @@
 
       // কোন লেয়ারে ব্লক হচ্ছে সেটা আলাদাভাবে classify করি —
       // এটা আসল প্রশ্নের একটা গুরুত্বপূর্ণ অংশ: "কোন ধরনের ব্লকার"
-      let layer = 'none';
+      // dnsProbeBlocked এখন নিজে থেকেই নির্ভরযোগ্য (provider self-check
+      // থেকে আসা), তাই এটাকে else-if এর সবার শেষে না রেখে independent
+      // ভাবে যোগ করছি — DNS-resolver active থাকলে extension না থাকলেও
+      // সেটা রিপোর্ট হওয়া উচিত।
+      const layers = [];
       if (signals.baitElementHidden || signals.baitElementRemoved) {
-        layer = 'browser_or_extension'; // cosmetic filtering -> extension/Brave/Firefox
-      } else if (signals.localScriptBlocked || signals.remoteScriptBlocked) {
-        layer = 'extension_network_filter'; // request filtering -> extension/browser network rule
-      } else if (signals.dnsProbeBlocked) {
-        layer = 'dns_or_network'; // DOM/script signal নাই কিন্তু network request যাচ্ছে না -> DNS/VPN/router
+        layers.push('browser_or_extension'); // cosmetic filtering -> extension/Brave/Firefox
       }
+      if (signals.localScriptBlocked || signals.remoteScriptBlocked) {
+        layers.push('extension_network_filter'); // request filtering -> extension/browser network rule
+      }
+      if (signals.dnsProbeBlocked) {
+        layers.push('dns_resolver'); // dns.adguard.com ইত্যাদি self-check অনুযায়ী active DNS filtering
+      }
+      const layer = layers.length ? layers.join('+') : 'none';
 
       return {
         blocked: confidence >= opts.confidenceThreshold,
         confidence: Number(confidence.toFixed(2)),
         layer,
+        layers,
+        dnsProviders: dnsCheck.providers, // কোন কোন DNS প্রোভাইডার active ধরা পড়েছে
         signals,
       };
     })();
