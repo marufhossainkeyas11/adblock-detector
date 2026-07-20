@@ -31,6 +31,7 @@ adblock-detector/
 | `localScriptBlocked` | Extension network-filter, filename-প্যাটার্ন rule | নিজের ডোমেইনে `ad_728.js` fetch করে দেখা হয় request block হয় কিনা |
 | `remoteScriptBlocked` | Filter list (EasyList/uAssets) যেগুলো Google Ads স্ক্রিপ্ট চেনে | `gpt.js`, `adsbygoogle.js` ইত্যাদি known URL fetch করে |
 | `dnsProbeBlocked` | নির্দিষ্ট DNS resolver (যেমন AdGuard DNS app) সত্যিই active কিনা | Provider-এর নিজস্ব self-check endpoint (`dns.adguard.com/test.json`) কল করে দেখা হয় — এটা ad/tracker ডোমেইন না বলে filter list দিয়ে ব্লক হয় না, তাই extension থাকা-না-থাকার সাথে independent থাকে |
+| `dnsLevelConfirmed` (differential probe) | যেকোনো DNS/network-level ব্লক (Pi-hole, AdGuard DNS, router, ISP) — provider-নির্দিষ্ট না, generic | একই ad ডোমেইনে দুই রকম request পাঠানো হয়: (১) সরাসরি ব্রাউজার fetch, (২) DoH JSON API (Cloudflare) দিয়ে শুধু resolve। দুটোই fail করলে DNS-level নিশ্চিত; শুধু প্রথমটা fail করলে সেটা extension-level |
 | `mutationRemoval` (via `watchBaitRemoval`) | দেরিতে কাজ করা lazy/background cosmetic filter | MutationObserver দিয়ে bait element persistent রেখে পরে remove হওয়া observe করা |
 
 ## কনফিডেন্স স্কোরিং কেন
@@ -69,6 +70,45 @@ adblock-detector/
   স্কিমা সময়ে সময়ে বদলাতে পারে, তাই `CONFIG.dnsSelfCheckProviders[].parse`
   ফাংশনটা defensively লেখা হয়েছে কিন্তু production এ যাওয়ার আগে
   actual response shape verify করে নেওয়া উচিত।
+
+## Differential DoH probe — কীভাবে DNS-level বনাম extension-level আলাদা হয়
+
+ইউজারের মূল আইডিয়া ছিল: "ad ডোমেইনে request পাঠাও, fail হলে DNS block
+ধরে নাও।" সমস্যা হলো একটামাত্র request দিয়ে **কেন** fail হলো সেটা বোঝা
+যায় না — extension ব্লক আর DNS sinkhole দুটোই ব্রাউজারের কাছে identical
+দেখায় (`fetch()` reject করে)।
+
+সমাধান হলো **দুটো ভিন্ন-রুটের request পাঠিয়ে ফলাফল তুলনা করা**:
+
+1. **Direct probe**: ad ডোমেইনে (`doubleclick.net`) সরাসরি fetch — extension
+   ও DNS দুটোই এটা আটকাতে পারে।
+2. **DoH probe**: সেই একই ডোমেইনের নাম Cloudflare-এর DNS-over-HTTPS JSON
+   API (`cloudflare-dns.com/dns-query`) দিয়ে resolve করা — এই request-এর
+   destination host `cloudflare-dns.com`, `doubleclick.net` না, তাই filter
+   list এটাকে "ad request" হিসেবে চেনে না এবং ব্লক করে না।
+
+| Direct | DoH resolve | সিদ্ধান্ত |
+|---|---|---|
+| সফল | — | ব্লক নেই |
+| ব্যর্থ | সফল (resolve হলো) | extension/browser-level ব্লক — DNS ঠিক আছে |
+| ব্যর্থ | ব্যর্থ (resolve হলো না) | DNS/network-level ব্লক (bypass route দিয়েও আটকাচ্ছে) |
+
+### এই টেকনিকের সীমাবদ্ধতা
+- **DoH নিজেই ব্লক হতে পারে** — কিছু router/enterprise firewall
+  well-known DoH endpoint (Cloudflare, Google) নিজেই ব্লক করে দেয় যাতে
+  device DNS bypass করতে না পারে। সেক্ষেত্রে DoH probe নিজেও fail করবে,
+  কিন্তু এটা "confirmed DNS-level ব্লক" না, বরং "DoH blocked" — কোডে এই
+  কেসটাকে `unknown` verdict হিসেবে আলাদা রাখা হয়েছে যাতে ভুলভাবে
+  confident না হয়।
+- **কিছু extension DoH request-ও ব্লক করতে পারে** (rare, কিন্তু কিছু
+  aggressive privacy extension DNS-over-HTTPS traffic নিজেই ইন্টারসেপ্ট
+  করে) — এই edge case এ `dns_level` ভুল করে রিপোর্ট হতে পারে। এটা বিরল
+  কিন্তু সম্ভব, তাই `differentialDns` অবজেক্টের raw ডেটা লগ করে রাখা
+  ভালো যদি accuracy নিয়ে সন্দেহ হয়।
+- **`doubleclick.net`-এ সরাসরি request পাঠানো মানে actual ad-network
+  ট্রাফিক জেনারেট হওয়া** — যদিও `favicon.ico` পাথে যাচ্ছে (কোনো ট্র্যাকিং
+  পিক্সেল না), কিছু privacy-conscious ইউজার এটা পছন্দ নাও করতে পারে।
+  চাইলে অন্য কোনো কম-sensitive ad-related ডোমেইন দিয়ে replace করা যায়।
 - **Stealth-মোড ব্লকার** (AdLock stealth, AdGuard Extra, কিছু 2026-সালের
   advanced blocker) নিজেদের অস্তিত্ব লুকানোর জন্যই ডিজাইন করা — bait
   element কে সরানোর বদলে fake content দিয়ে replace করতে পারে, বা network
