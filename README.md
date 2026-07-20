@@ -30,7 +30,7 @@ adblock-detector/
 | `baitElementHidden` / `baitElementRemoved` | Extension (uBlock, ABP), Brave Shields, Firefox Strict Mode | Common ad class/id দিয়ে div বসিয়ে দেখা হয় CSS দিয়ে hide বা DOM থেকে remove হয় কিনা |
 | `localScriptBlocked` | Extension network-filter, filename-প্যাটার্ন rule | নিজের ডোমেইনে `ad_728.js` fetch করে দেখা হয় request block হয় কিনা |
 | `remoteScriptBlocked` | Filter list (EasyList/uAssets) যেগুলো Google Ads স্ক্রিপ্ট চেনে | `gpt.js`, `adsbygoogle.js` ইত্যাদি known URL fetch করে |
-| `dnsProbeBlocked` | Pi-hole, NextDNS, router-level DNS filter, network-wide VPN ad-block | known ad-pixel ডোমেইনে image request পাঠিয়ে load/error/timeout দেখা হয় — DOM-এ কোনো bait লাগে না কারণ DNS-লেভেলে তো পুরো ডোমেইনটাই resolve হয় না |
+| `dnsProbeBlocked` | নির্দিষ্ট DNS resolver (যেমন AdGuard DNS app) সত্যিই active কিনা | Provider-এর নিজস্ব self-check endpoint (`dns.adguard.com/test.json`) কল করে দেখা হয় — এটা ad/tracker ডোমেইন না বলে filter list দিয়ে ব্লক হয় না, তাই extension থাকা-না-থাকার সাথে independent থাকে |
 | `mutationRemoval` (via `watchBaitRemoval`) | দেরিতে কাজ করা lazy/background cosmetic filter | MutationObserver দিয়ে bait element persistent রেখে পরে remove হওয়া observe করা |
 
 ## কনফিডেন্স স্কোরিং কেন
@@ -50,10 +50,25 @@ adblock-detector/
 - **১০০% নির্ভুল কোনো পদ্ধতি নেই।** অ্যাডব্লকার আর অ্যান্টি-অ্যাডব্লকার একটা
   চলমান আর্মস-রেস — filter list গুলো নিয়মিত bait প্যাটার্ন আপডেট করে, তাই
   bait class name/script name সময় সময় বদলানো লাগবে।
-- **DNS-level ব্লক (Pi-hole/NextDNS) সরাসরি "ব্লকার আছে" বলে কনফার্ম করা
-  যায় না** — শুধু "এই নির্দিষ্ট known-ad ডোমেইনে request যাচ্ছে না" এটা বলা
-  যায়। এটা VPN আউটেজ, ISP সমস্যা, বা সাময়িক নেটওয়ার্ক গ্লিচেও হতে পারে,
-  তাই এখানে confidence কম রাখা হয়েছে (single strong signal না)।
+- **DNS self-check শুধু ঐ নির্দিষ্ট প্রোভাইডার ধরে** — এখন `dns.adguard.com`
+  এর self-check endpoint ব্যবহার হচ্ছে, তাই এটা শুধু AdGuard DNS
+  active থাকলে ধরবে। Pi-hole বা কাস্টম-সেটআপ router-level DNS ধরতে
+  চাইলে সেই প্রোভাইডারের নিজস্ব self-check endpoint নাই (Pi-hole
+  ব্যক্তিগত/self-hosted, তাই কোনো পাবলিক self-check API নেই) — সেক্ষেত্রে
+  এই সিগন্যালটা কার্যকর হবে না, শুধু bait/script সিগন্যাল দিয়েই যেটুকু
+  ধরা যায় তা ধরা যাবে। যদি নিজস্ব নেটওয়ার্কে Pi-hole থাকে, একমাত্র
+  নির্ভরযোগ্য উপায় হলো নিজের Pi-hole instance এ একটা query-log API
+  এক্সপোজ করে সেখান থেকে চেক করা (আলাদা ইনফ্রাস্ট্রাকচার লাগবে,
+  ক্লায়েন্ট-সাইড জাভাস্ক্রিপ্ট দিয়ে সম্ভব না, কারণ Pi-hole সাধারণত LAN-এর
+  ভেতরে থাকে, পাবলিক ইন্টারনেট থেকে অ্যাক্সেসযোগ্য না)।
+- **CORS নির্ভরতা** — self-check endpoint যদি `Access-Control-Allow-Origin`
+  header না পাঠায়, ব্রাউজার fetch()-কে ব্লক করে দেবে এবং false-negative
+  হবে (`null` রিটার্ন করে "অনিশ্চিত" ধরা হয়, positive না)। প্রোডাকশনে
+  বসানোর আগে DevTools Console-এ সরাসরি `fetch('https://dns.adguard.com/test.json').then(r=>r.json()).then(console.log)`
+  চালিয়ে CORS ও রেসপন্স ফরম্যাট যাচাই করে নাও — এন্ডপয়েন্টের JSON
+  স্কিমা সময়ে সময়ে বদলাতে পারে, তাই `CONFIG.dnsSelfCheckProviders[].parse`
+  ফাংশনটা defensively লেখা হয়েছে কিন্তু production এ যাওয়ার আগে
+  actual response shape verify করে নেওয়া উচিত।
 - **Stealth-মোড ব্লকার** (AdLock stealth, AdGuard Extra, কিছু 2026-সালের
   advanced blocker) নিজেদের অস্তিত্ব লুকানোর জন্যই ডিজাইন করা — bait
   element কে সরানোর বদলে fake content দিয়ে replace করতে পারে, বা network
